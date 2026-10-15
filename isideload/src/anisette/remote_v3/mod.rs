@@ -118,12 +118,13 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
 
     // Use the identity supplied by the server generating the anisette data.
     async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
-        self.client.get(format!("{}/v3/client_info", self.url))
+        let info = self.client.get(format!("{}/v3/client_info", self.url))
             .send().await
             .context("Failed to request anisette client info")?
             .error_for_status().context("Anisette client info HTTP error")?
             .json::<AnisetteClientInfo>().await
-            .context("Failed to parse anisette client info")
+            .context("Failed to parse anisette client info")?;
+        Ok(info)
     }
 
     fn needs_provisioning(&self) -> Result<bool, Report> {
