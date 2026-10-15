@@ -179,8 +179,8 @@ impl GrandSlam {
         headers.remove("X-Xcode-Version");
         headers.remove("X-Apple-App-Info");
         headers.insert("Accept", HeaderValue::from_static("*/*"));
-        headers.insert("X-Mme-Client-Info", HeaderValue::from_static(URL_BAG_CLIENT_INFO));
-        headers.insert("User-Agent", HeaderValue::from_static("akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"));
+        // Preserve the identity of the approved anisette provider.
+        // Preserve the provider User-Agent as well.
         Ok(headers)
     }
 
