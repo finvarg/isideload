@@ -708,6 +708,7 @@ impl AppleAccount {
         debug!("GrandSlam service URL: {}", gs_service_url);
 
         let mut cpd = anisette_data.get_client_provided_data();
+        normalize_srp_cpd(&mut cpd);
 
         let srp_client = srp::Client::<G2048, Sha256>::new_with_options(false);
         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
@@ -740,6 +741,7 @@ impl AppleAccount {
             let fresh = self.anisette_generator.resync(&sim).await
                 .context("Anisette resync failed")?;
             cpd = fresh.get_client_provided_data();
+            normalize_srp_cpd(&mut cpd);
             let retry = plist!(dict {
                 "Header": { "Version": "1.0.1" },
                 "Request": {
@@ -1091,5 +1093,12 @@ fn censor_email(email: &str) -> String {
         }
     } else {
         "***".to_string()
+    }
+}
+
+// SRP flags are plist booleans, not strings.
+fn normalize_srp_cpd(cpd: &mut Dictionary) {
+    for (key, value) in [("bootstrap", true), ("icscrec", true), ("pbe", false), ("prkgen", true)] {
+        cpd.insert(key.to_string(), plist::Value::Boolean(value));
     }
 }
