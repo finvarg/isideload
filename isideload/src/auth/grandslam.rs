@@ -143,7 +143,9 @@ impl GrandSlam {
         additional_headers: Option<HeaderMap>,
     ) -> Result<Dictionary, Report> {
         let resp = self
-            .post(url)?
+            .client
+            .post(url)
+            .headers(Self::plist_headers(&self.client_info)?)
             .headers(additional_headers.unwrap_or_else(reqwest::header::HeaderMap::new))
             .body(plist_to_xml_string(body))
             .send()
@@ -169,6 +171,17 @@ impl GrandSlam {
             })?;
 
         Ok(response_plist)
+    }
+
+    // SRP plist requests use AuthKit headers, not developer-service headers.
+    fn plist_headers(client_info: &AnisetteClientInfo) -> Result<HeaderMap, Report> {
+        let mut headers = Self::base_headers(client_info, false)?;
+        headers.remove("X-Xcode-Version");
+        headers.remove("X-Apple-App-Info");
+        headers.insert("Accept", HeaderValue::from_static("*/*"));
+        headers.insert("X-Mme-Client-Info", HeaderValue::from_static(URL_BAG_CLIENT_INFO));
+        headers.insert("User-Agent", HeaderValue::from_static("akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"));
+        Ok(headers)
     }
 
     fn base_headers(
