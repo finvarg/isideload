@@ -176,6 +176,8 @@ impl GrandSlam {
         sms: bool,
     ) -> Result<reqwest::header::HeaderMap, Report> {
         let mut headers = reqwest::header::HeaderMap::new();
+        #[cfg(not(feature = "wasm"))]
+        headers.insert("Connection", HeaderValue::from_static("close"));
         if !sms {
             headers.insert("Content-Type", HeaderValue::from_static("text/x-xml-plist"));
             headers.insert("Accept", HeaderValue::from_static("text/x-xml-plist"));
@@ -218,6 +220,8 @@ impl GrandSlam {
         #[cfg(not(feature = "wasm"))]
         let client = ClientBuilder::new()
             .add_root_certificate(cert)
+            .http1_only()
+            .pool_max_idle_per_host(0)
             .http1_title_case_headers()
             .danger_accept_invalid_certs(debug)
             .connection_verbose(debug)
