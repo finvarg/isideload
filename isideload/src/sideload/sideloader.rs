@@ -10,17 +10,21 @@ use crate::{
     sideload::{
         TeamSelection,
         application::{Application, SpecialApp},
-        builder::MaxCertsBehavior,
+        builder::{ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior},
         bundle::Bundle,
         cert_identity::CertificateIdentity,
         sign,
     },
-    util::{device::IdeviceInfo, storage::SideloadingStorage},
+    util::{
+        callbacks::{ExtensionsBehaviorCallback, MaxCertsCallback},
+        device::IdeviceInfo,
+        storage::SideloadingStorage,
+    },
 };
 
 use std::path::PathBuf;
 
-use apple_codesign::ProvisioningProfile;
+use apple_codesign_quick::ProvisioningProfile;
 use idevice::{
     IdeviceService,
     provider::IdeviceProvider,
@@ -30,19 +34,19 @@ use plist::Dictionary;
 use rootcause::{option_ext::OptionExt, prelude::*};
 use tracing::info;
 
-pub struct Sideloader {
+pub struct Sideloader<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> {
     team_selection: TeamSelection,
     storage: Box<dyn SideloadingStorage>,
     dev_session: DeveloperSession,
     machine_name: String,
     apple_email: String,
-    max_certs_behavior: MaxCertsBehavior,
-    //extensions_behavior: ExtensionsBehavior,
+    max_certs_behavior: MaxCertsBehavior<C>,
+    extensions_behavior: ExtensionsBehaviorSelection<E>,
     delete_app_after_install: bool,
     team: Option<DeveloperTeam>,
 }
 
-impl Sideloader {
+impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
     /// Construct a new `Sideloader` instance with the provided configuration
     ///
     /// See [`crate::sideload::SideloaderBuilder`] for more details and a more convenient way to construct a `Sideloader`.
@@ -50,10 +54,10 @@ impl Sideloader {
         dev_session: DeveloperSession,
         apple_email: String,
         team_selection: TeamSelection,
-        max_certs_behavior: MaxCertsBehavior,
+        max_certs_behavior: MaxCertsBehavior<C>,
         machine_name: String,
         storage: Box<dyn SideloadingStorage>,
-        //extensions_behavior: ExtensionsBehavior,
+        extensions_behavior: ExtensionsBehaviorSelection<E>,
         delete_app_after_install: bool,
     ) -> Self {
         Sideloader {
@@ -63,13 +67,15 @@ impl Sideloader {
             machine_name,
             apple_email,
             max_certs_behavior,
-            //extensions_behavior,
+            extensions_behavior,
             delete_app_after_install,
             team: None,
         }
     }
 
     /// Sign the app at the provided path and return the path to the signed app bundle (in a temp dir). To sign and install, see [`Self::install_app`].
+    /// `pairing_file` is the optional pairing file to be encrypted and placed in the bundle if installing AltStore.
+    /// `device_udid` is the optional device UDID to be used for AltStore pairing file injection.
     pub async fn sign_app<F, Fut>(
         &mut self,
         app_path: PathBuf,
@@ -77,6 +83,8 @@ impl Sideloader {
         // this will be replaced with proper entitlement handling later
         increased_memory_limit: bool,
         progress_callback: Option<F>,
+        pairing_file: Option<&[u8]>,
+        device_udid: Option<&str>,
     ) -> Result<(PathBuf, Option<SpecialApp>), Report>
     where
         F: Fn(f32) -> Fut,
@@ -124,11 +132,14 @@ impl Sideloader {
             .filter_map(|bundle| bundle.bundle_identifier().map(str::to_string))
             .collect::<std::collections::HashSet<_>>();
 
+        let extensions_behavior = self
+            .extensions_behavior
+            .behavior(app.bundle.app_extensions())
+            .await?;
+        // watchOS apps require their own platform-specific profiles.
+        let extensions_behavior = extensions_behavior.with_watch_support(!watch_bundle_ids.is_empty());
         let mut app_ids = app
-            .register_app_ids(
-                /*&self.extensions_behavior, */ &mut self.dev_session,
-                &team,
-            )
+            .register_app_ids(&extensions_behavior, &mut self.dev_session, &team)
             .await?;
         let main_app_id = match app_ids
             .iter()
@@ -202,9 +213,15 @@ impl Sideloader {
 
         info!("App IDs configured");
 
-        app.apply_special_app_behavior(&special, &group_identifier, &cert_identity)
-            .await
-            .context("Failed to modify app bundle")?;
+        app.apply_special_app_behavior(
+            &special,
+            &group_identifier,
+            &cert_identity,
+            pairing_file,
+            device_udid,
+        )
+        .await
+        .context("Failed to modify app bundle")?;
 
         let main_provisioning_profile = self
             .dev_session
@@ -213,31 +230,51 @@ impl Sideloader {
 
         let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();
 
-        for id in app_ids
-            .into_iter()
-            .filter(|id| id.identifier != main_app_id.identifier)
-        {
-            let bundle_id = id.identifier.clone();
+        match extensions_behavior {
+            ExtensionsBehavior::ReuseMain => {
+                // For each extension bundle id, push the main provisioning profile and entitlements to the provisioning_profiles vector
+                let main_entitlements =
+                    ProvisioningProfile::parse(main_provisioning_profile.encoded_profile.as_ref())?
+                        .entitlements()
+                        .clone();
+                let extensions = app.bundle.app_extensions();
+                for ext in extensions {
+                    provisioning_profiles.push((
+                        ext.bundle_identifier().unwrap_or_default().to_string(),
+                        main_provisioning_profile.clone(),
+                        main_entitlements.clone(),
+                    ));
+                }
+            }
+            ExtensionsBehavior::RegisterAll => {
+                for id in app_ids
+                    .into_iter()
+                    .filter(|id| id.identifier != main_app_id.identifier)
+                {
+                    let bundle_id = id.identifier.clone();
 
-            let profile_device_type = if watch_bundle_ids.contains(&bundle_id) {
-                Some(DeveloperDeviceType::Watchos)
-            } else {
-                None
-            };
+                    let profile_device_type = if watch_bundle_ids.contains(&bundle_id) {
+                        Some(DeveloperDeviceType::Watchos)
+                    } else {
+                        None
+                    };
 
-            let profile = self
-                .dev_session
-                .download_team_provisioning_profile(&team, &id, profile_device_type)
-                .await
-                .context(format!(
-                    "Failed to download provisioning profile for {}",
-                    bundle_id
-                ))?;
+                    let profile = self
+                        .dev_session
+                        .download_team_provisioning_profile(&team, &id, profile_device_type)
+                        .await
+                        .context(format!(
+                            "Failed to download provisioning profile for {}",
+                            bundle_id
+                        ))?;
 
-            let parsed_profile = ProvisioningProfile::parse(profile.encoded_profile.as_ref())?;
-            let entitlements = parsed_profile.entitlements().clone();
+                    let parsed_profile =
+                        ProvisioningProfile::parse(profile.encoded_profile.as_ref())?;
+                    let entitlements = parsed_profile.entitlements().clone();
 
-            provisioning_profiles.push((bundle_id, profile, entitlements));
+                    provisioning_profiles.push((bundle_id, profile, entitlements));
+                }
+            }
         }
 
         if let Some(callback) = &progress_callback {
@@ -258,7 +295,7 @@ impl Sideloader {
             &mut app,
             &cert_identity,
             &main_provisioning_profile,
-            &provisioning_profiles,
+            &mut provisioning_profiles,
             &special,
             &team,
             progress_callback,
@@ -273,6 +310,9 @@ impl Sideloader {
 
     #[cfg(feature = "install")]
     /// Sign and install an app to a device.
+    /// This is more intended to be a helper function for simple use cases, for more complex scenarios you should call `sign_app` and `install_app` separately.
+    /// `pairing_file` is the optional pairing file to be encrypted and placed in the bundle if installing AltStore.
+    /// `device_udid` is the optional device UDID to be used for AltStore pairing file injection.
     pub async fn install_app<F, Fut>(
         &mut self,
         device_provider: &impl IdeviceProvider,
@@ -280,6 +320,7 @@ impl Sideloader {
         // this is gross but will be replaced with proper entitlement handling later
         increased_memory_limit: bool,
         progress_callback: Option<F>,
+        pairing_file: Option<&[u8]>,
     ) -> Result<Option<SpecialApp>, Report>
     where
         F: Fn(f32) -> Fut,
@@ -333,13 +374,20 @@ impl Sideloader {
                 Some(team),
                 increased_memory_limit,
                 progress_callback,
+                pairing_file,
+                Some(&device_info.udid),
             )
             .await?;
 
         info!("Transferring App...");
 
+        let last_logged_progress = std::sync::Arc::new(std::sync::Mutex::new(0));
         crate::sideload::install::install_app(device_provider, &signed_app_path, |progress| {
-            info!("Installing: {}%", progress);
+            let mut last_progress = last_logged_progress.lock().unwrap();
+            if progress >= *last_progress + 10 {
+                *last_progress = progress;
+                info!("Installing: {}%", progress);
+            }
         })
         .await
         .context("Failed to install app on device")?;

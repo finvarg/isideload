@@ -11,13 +11,15 @@ use reqwest::{
 use reqwest_middleware::ClientBuilder as MwClientBuilder;
 use rootcause::prelude::*;
 use tracing::debug;
+use tracing::warn;
 
 #[cfg(not(feature = "wasm"))]
 use crate::sideload::cert_identity::APPLE_ROOT;
 use crate::{SideloadError, anisette::AnisetteClientInfo, util::plist::PlistDataExtract};
 
 const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
-const URL_BAG_CLIENT_INFO: &str = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+const URL_BAG_CLIENT_INFO: &str =
+    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 
 pub struct GrandSlam {
     pub client: reqwest_middleware::ClientWithMiddleware,
@@ -52,7 +54,11 @@ impl GrandSlam {
         mut base_headers: HeaderMap,
     ) -> Result<Dictionary, Report> {
         debug!("Fetching URL bag from GrandSlam");
-        base_headers.insert("X-Mme-Client-Info", HeaderValue::from_str(URL_BAG_CLIENT_INFO)?);
+        // Sending the android client info gets us the wrong url bag, so we lie for this request
+        base_headers.insert(
+            "X-Mme-Client-Info",
+            HeaderValue::from_str(URL_BAG_CLIENT_INFO)?,
+        );
         let resp = client
             .get(URL_BAG)
             .headers(base_headers)
@@ -141,16 +147,43 @@ impl GrandSlam {
         url: &str,
         body: &Dictionary,
         additional_headers: Option<HeaderMap>,
+        retry_limit: Option<u32>,
     ) -> Result<Dictionary, Report> {
-        let resp = self
+        let result = self
             .client
             .post(url)
             .headers(Self::plist_headers(&self.client_info)?)
-            .headers(additional_headers.unwrap_or_else(reqwest::header::HeaderMap::new))
+            .headers(
+                additional_headers
+                    .clone()
+                    .unwrap_or_else(reqwest::header::HeaderMap::new),
+            )
             .body(plist_to_xml_string(body))
             .send()
             .await
-            .context("Failed to send grandslam request")?
+            .context("Failed to send grandslam request")?;
+
+        if let Some(retries) = retry_limit
+            && result.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            if retries > 0 {
+                warn!(
+                    "Received 429 Too Many Requests, retrying request ({} retries left)",
+                    retries
+                );
+                return Box::pin(self.plist_request(
+                    url,
+                    body,
+                    additional_headers,
+                    Some(retries - 1),
+                ))
+                .await;
+            } else {
+                bail!("Received 429 Too Many Requests, no retries left");
+            }
+        }
+
+        let resp = result
             .error_for_status()
             .context("Received error response from grandslam")?
             .text()
@@ -173,14 +206,11 @@ impl GrandSlam {
         Ok(response_plist)
     }
 
-    // SRP plist requests use AuthKit headers, not developer-service headers.
     fn plist_headers(client_info: &AnisetteClientInfo) -> Result<HeaderMap, Report> {
         let mut headers = Self::base_headers(client_info, false)?;
         headers.remove("X-Xcode-Version");
         headers.remove("X-Apple-App-Info");
         headers.insert("Accept", HeaderValue::from_static("*/*"));
-        // Preserve the identity of the approved anisette provider.
-        // Preserve the provider User-Agent as well.
         Ok(headers)
     }
 
@@ -189,8 +219,6 @@ impl GrandSlam {
         sms: bool,
     ) -> Result<reqwest::header::HeaderMap, Report> {
         let mut headers = reqwest::header::HeaderMap::new();
-        #[cfg(not(feature = "wasm"))]
-        headers.insert("Connection", HeaderValue::from_static("close"));
         if !sms {
             headers.insert("Content-Type", HeaderValue::from_static("text/x-xml-plist"));
             headers.insert("Accept", HeaderValue::from_static("text/x-xml-plist"));
@@ -214,6 +242,10 @@ impl GrandSlam {
             "X-Apple-App-Info",
             HeaderValue::from_static("com.apple.gs.xcode.auth"),
         );
+        headers.insert(
+            reqwest::header::CONNECTION,
+            HeaderValue::from_static("close"),
+        );
 
         Ok(headers)
     }
@@ -225,7 +257,8 @@ impl GrandSlam {
     /// # Errors
     /// Returns an error if the reqwest client cannot be built
     pub fn build_reqwest_client(
-        debug: bool,
+        #[cfg(not(feature = "wasm"))] debug: bool,
+        #[cfg(feature = "wasm")] _debug: bool,
         proxy_url: Option<String>,
     ) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
         #[cfg(not(feature = "wasm"))]
@@ -238,6 +271,7 @@ impl GrandSlam {
             .http1_title_case_headers()
             .danger_accept_invalid_certs(debug)
             .connection_verbose(debug)
+            // .pool_max_idle_per_host(0)
             .build()?;
         #[cfg(feature = "wasm")]
         let client = ClientBuilder::new().build()?;
