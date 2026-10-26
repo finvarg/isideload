@@ -132,7 +132,6 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
             .filter_map(|bundle| bundle.bundle_identifier().map(str::to_string))
             .collect::<std::collections::HashSet<_>>();
 
-
         let extensions_behavior = self
             .extensions_behavior
             .behavior(app.bundle.app_extensions())
@@ -254,20 +253,20 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
                 {
                     let bundle_id = id.identifier.clone();
 
-            let profile_device_type = if watch_bundle_ids.contains(&bundle_id) {
-                Some(DeveloperDeviceType::Watchos)
-            } else {
-                None
-            };
+                    let profile_device_type = if watch_bundle_ids.contains(&bundle_id) {
+                        Some(DeveloperDeviceType::Watchos)
+                    } else {
+                        None
+                    };
 
-            let profile = self
-                .dev_session
-                .download_team_provisioning_profile(&team, &id, profile_device_type)
-                .await
-                .context(format!(
-                    "Failed to download provisioning profile for {}",
-                    bundle_id
-                ))?;
+                    let profile = self
+                        .dev_session
+                        .download_team_provisioning_profile(&team, &id, profile_device_type)
+                        .await
+                        .context(format!(
+                            "Failed to download provisioning profile for {}",
+                            bundle_id
+                        ))?;
 
                     let parsed_profile =
                         ProvisioningProfile::parse(profile.encoded_profile.as_ref())?;
