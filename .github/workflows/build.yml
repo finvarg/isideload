@@ -3,11 +3,15 @@ name: "Build isideload"
 on:
   push:
     branches:
-      - "**"
+      - "fix/watch-login-20261014"
   pull_request:
     branches:
-      - "**"
+      - "fix/watch-login-20261014"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
