@@ -2,6 +2,7 @@ use crate::{
     dev::{
         developer_session::DeveloperSession,
         device_type::{DeveloperDeviceType, apply_platform_to_body, dev_url},
+        normalize_app_names,
         teams::DeveloperTeam,
     },
     util::plist::{PlistDataExtract, SensitivePlistAttachment},
@@ -68,7 +69,7 @@ pub trait AppIdsApi {
         let mut body = plist!(dict {
             "teamId": &team.team_id,
             "identifier": identifier,
-            "name": name,
+            "name": normalize_app_names(name),
         });
         apply_platform_to_body(&mut body, &device_type);
 

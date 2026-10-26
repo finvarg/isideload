@@ -16,12 +16,15 @@ use rootcause::prelude::*;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::anisette::remote_v3::{state::AnisetteState, websocket::WsMessage};
+use crate::anisette::remote_v3::websocket::AppWebSocket;
 use crate::anisette::{AnisetteClientInfo, AnisetteData, AnisetteProvider};
+use crate::anisette::{
+    AnisetteDataResponse,
+    remote_v3::{state::AnisetteState, websocket::WsMessage},
+};
 use crate::auth::grandslam::GrandSlam;
 use crate::util::plist::PlistDataExtract;
 use crate::util::storage::{SideloadingStorage, new_storage};
-use crate::{SideloadError, anisette::remote_v3::websocket::AppWebSocket};
 
 pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.jkcoxson.com";
 pub const ANISETTE_STATE_KEY: &str = "windows_anisette_state";
@@ -108,50 +111,54 @@ impl RemoteV3AnisetteProvider {
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
 impl AnisetteProvider for RemoteV3AnisetteProvider {
-    async fn get_anisette_data(&self) -> Result<AnisetteData, Report> {
+    async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, Report> {
         self.fetch_headers(None).await
     }
 
-    async fn resync(&self, sim: &str) -> Result<AnisetteData, Report> {
+    async fn resync(&self, sim: &str) -> Result<AnisetteDataResponse, Report> {
         self.fetch_headers(Some(sim)).await
     }
 
-    // Use the identity supplied by the server generating the anisette data.
+    // Can be hardcoded, but apple is changing things so much nowadays it makes more sense to just get it from the server
     async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
-        let info = self.client.get(format!("{}/v3/client_info", self.url))
-            .send().await
-            .context("Failed to request anisette client info")?
-            .error_for_status().context("Anisette client info HTTP error")?
-            .json::<AnisetteClientInfo>().await
-            .context("Failed to parse anisette client info")?;
+        let info = self
+            .client
+            .get(format!("{}/v3/client_info", self.url))
+            .send()
+            .await
+            .context("Failed to request /v3/client_info from anisette server")?
+            .error_for_status()
+            .context("anisette server returned an error for /v3/client_info")?
+            .json::<AnisetteClientInfo>()
+            .await
+            .context("Failed to parse /v3/client_info response")?;
+
+        // let info = AnisetteClientInfo {
+        //     client_info:
+        //         "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        //             .to_string(),
+        //     user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
+        // };
         Ok(info)
     }
 
-    fn needs_provisioning(&self) -> Result<bool, Report> {
-        if let Some(state) = &self.state {
-            Ok(!state.is_provisioned())
-        } else {
-            Ok(true)
-        }
-    }
-
-    async fn provision(&mut self, gs: Arc<GrandSlam>) -> Result<(), Report> {
+    async fn provision(&mut self, gs: &Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
         self.get_client_info().await?;
-        self.get_state(gs).await?;
+        self.get_state(gs, force_reset).await?;
         Ok(())
     }
 }
 
 impl RemoteV3AnisetteProvider {
-    async fn fetch_headers(&self, sim: Option<&str>) -> Result<AnisetteData, Report> {
-        let state = self
-            .state
-            .as_ref()
-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
-        let adi_pb = state
-            .adi_pb
-            .as_ref()
-            .ok_or(SideloadError::AnisetteNotProvisioned)?;
+    async fn fetch_headers(&self, sim: Option<&str>) -> Result<AnisetteDataResponse, Report> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(AnisetteDataResponse::NeedsProvisioning);
+        };
+
+        let Some(adi_pb) = state.adi_pb.as_ref() else {
+            return Ok(AnisetteDataResponse::NeedsProvisioning);
+        };
+
         let client_info = self.get_client_info().await?;
 
         let mut body = serde_json::json!({
@@ -180,7 +187,7 @@ impl RemoteV3AnisetteProvider {
                 machine_id,
                 one_time_password,
                 routing_info,
-            } => Ok(AnisetteData {
+            } => Ok(AnisetteDataResponse::Data(AnisetteData {
                 machine_id,
                 one_time_password,
                 routing_info,
@@ -188,15 +195,26 @@ impl RemoteV3AnisetteProvider {
                 device_unique_identifier: state.get_device_id(),
                 _local_user_id: hex::encode(state.get_md_lu()),
                 generated_at: SystemTime::now(),
-            }),
+            })),
             AnisetteHeaders::GetHeadersError { message } => {
+                if message.contains("-45061") {
+                    warn!("Server says anisette not provisioned");
+                    return Ok(AnisetteDataResponse::IncorrectlyProvisioned);
+                }
                 Err(report!("Failed to get anisette headers").attach(message))
             }
         }
     }
 
-    async fn get_state(&mut self, gs: Arc<GrandSlam>) -> Result<&mut AnisetteState, Report> {
-        if self.state.is_none() {
+    async fn get_state(
+        &mut self,
+        gs: &Arc<GrandSlam>,
+        force_reset: bool,
+    ) -> Result<&mut AnisetteState, Report> {
+        if force_reset {
+            warn!("Resetting anisette state");
+            self.state = Some(AnisetteState::new());
+        } else if self.state.is_none() {
             if let Ok(Some(state)) = &self.storage.retrieve_data(ANISETTE_STATE_KEY) {
                 if let Ok(state) = plist::from_bytes(state) {
                     info!("Loaded existing anisette state");
@@ -254,7 +272,7 @@ impl RemoteV3AnisetteProvider {
     }
     async fn provision(
         state: &mut AnisetteState,
-        gs: Arc<GrandSlam>,
+        gs: &Arc<GrandSlam>,
         url: &str,
         proxy_url: Option<&str>,
     ) -> Result<(), Report> {
@@ -318,6 +336,7 @@ impl RemoteV3AnisetteProvider {
                             &start_provisioning,
                             &body,
                             Some(Self::provisioning_headers(state).await?),
+                            None,
                         )
                         .await
                         .context("Failed to send start provisioning request")?;
@@ -349,6 +368,7 @@ impl RemoteV3AnisetteProvider {
                             &end_provisioning,
                             &body,
                             Some(Self::provisioning_headers(state).await?),
+                            None,
                         )
                         .await
                         .context("Failed to send end provisioning request")?;
